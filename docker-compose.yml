@@ -1,0 +1,52 @@
+name: store_analytics
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: store_analytics_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: store_analytics
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d store_analytics"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    build: .
+    image: store_analytics_worker:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: store_analytics
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      DEVICE: cuda
+      CUDA_VISIBLE_DEVICES: "0"
+    volumes:
+      - ./videos:/app/videos:ro
+      - ./weights:/app/weights:ro
+      - ./logs:/app/logs
+      - ./outputs:/app/outputs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  postgres_data:

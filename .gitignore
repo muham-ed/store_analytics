@@ -1,0 +1,30 @@
+# Python & Virtualenvs
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# System & IDE
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Model Weights, Output Videos & Large Files
+weights/*.pt
+weights/*.pth
+videos/*.mp4
+videos/*.avi
+outputs/*.mp4
+outputs/*.avi
+outputs/heatmaps/*.jpg
+outputs/heatmaps/*.png
+
+# Logs & Environment Configuration
+logs/*.log
+.env
+
+# Docker & PostgreSQL Local Data
+postgres_data/
