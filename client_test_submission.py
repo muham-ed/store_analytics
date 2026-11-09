@@ -36,9 +36,12 @@ if hasattr(model, "to"):
 if hasattr(model, "eval"):
     model.eval()
 
-# Line Zone Setup: (0, 540) -> (1920, 540)
-start_point = sv.Point(x=0, y=540)
-end_point = sv.Point(x=width, y=540)
+# Correct Direction Line Setup:
+# Downwards (towards camera, top-to-bottom) = IN
+# Upwards (away from camera, bottom-to-top) = OUT
+# By setting start=(width, 540) and end=(0, 540), crossing top-to-bottom triggers crossed_in
+start_point = sv.Point(x=width, y=540)
+end_point = sv.Point(x=0, y=540)
 line_zone = sv.LineZone(
     start=start_point,
     end=end_point,
@@ -73,22 +76,14 @@ with torch.inference_mode():
         ret, frame = cap.read()
         if not ret:
             break
-        frame_idx += 1
+
         timestamp_sec = frame_idx / fps
 
-        # 1. Enhance low light / night vision using CLAHE on L channel
-        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        cl = clahe.apply(l)
-        enhanced_lab = cv2.merge((cl, a, b))
-        enhanced_frame = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
-
-        # 2. RF-DETR Detection
+        # RF-DETR Detection on standard image frame
         try:
-            detections = model.predict(enhanced_frame, threshold=0.35, include_source_image=False)
+            detections = model.predict(frame, threshold=0.35, include_source_image=False)
         except Exception:
-            detections = model.predict(enhanced_frame, threshold=0.35)
+            detections = model.predict(frame, threshold=0.35)
 
         if not isinstance(detections, sv.Detections):
             detections = sv.Detections.empty()
@@ -98,13 +93,13 @@ with torch.inference_mode():
             person_mask = (detections.class_id == 1) | (detections.class_id == 0)
             detections = detections[person_mask]
 
-        # 3. Supervision ByteTrack
+        # Supervision ByteTrack
         tracked = tracker.update_with_detections(detections)
 
-        # 4. Line Crossing Detection
+        # Line Crossing Detection
         in_mask, out_mask = line_zone.trigger(detections=tracked)
 
-        # Log IN events
+        # Log IN events (Downwards)
         if tracked.tracker_id is not None and len(tracked) > 0:
             for tid, is_in in zip(tracked.tracker_id, in_mask):
                 if is_in:
@@ -126,7 +121,7 @@ with torch.inference_mode():
                     events_log.append(row)
                     print(f"[EVENT] Frame {frame_idx} ({time_str}) - ID #{tid} crossed OUT (upwards)")
 
-        # 5. Annotation
+        # Annotation
         labels = [f"ID #{tid}" for tid in tracked.tracker_id] if tracked.tracker_id is not None else []
         annotated = frame.copy()
         if len(tracked) > 0:
@@ -140,6 +135,7 @@ with torch.inference_mode():
             annotated = line_annotator.annotate(scene=annotated, line_counter=line_zone)
 
         out.write(annotated)
+        frame_idx += 1
 
 cap.release()
 out.release()
@@ -151,7 +147,7 @@ proc_fps = total_frames / elapsed if elapsed > 0 else 0.0
 print("\n================ SUMMARY REPORT ================")
 print(f"Total Video Duration: {total_frames / fps:.2f} seconds ({total_frames} frames)")
 print(f"Total Processing Time: {elapsed:.2f} seconds ({proc_fps:.2f} FPS)")
-print(f"Final Count -> IN: {line_zone.in_count} | OUT: {line_zone.out_count}")
+print(f"Final Count -> IN (Downwards): {line_zone.in_count} | OUT (Upwards): {line_zone.out_count}")
 print(f"CSV Events saved to: {output_csv_path}")
 print(f"Annotated Video saved to: {output_video_path}")
 print("================================================")
