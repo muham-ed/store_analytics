@@ -1,153 +1,83 @@
-import os
-import time
-import csv
-import cv2
-import torch
-import numpy as np
-import supervision as sv
-import rfdetr
+"""People counting test: RF-DETR (detection) + Supervision (ByteTrack + LineZone).
+Usage: python client_test_submission.py people-walking.mp4
+Outputs: output_video.mp4, crossings_log.csv, run_info.txt (next to the script).
+Direction: line (W,540)->(0,540); walking DOWN (towards camera) = IN, UP = OUT.
+"""
+import argparse, csv, time, os
+import cv2, numpy as np, torch, supervision as sv
+from rfdetr import RFDETRLarge
 
-# Paths
-input_video_path = os.path.abspath("فيديوالعميل/people-walking (1).mp4")
-output_video_path = os.path.abspath("فيديوالعميل/output_video.mp4")
-output_csv_path = os.path.abspath("فيديوالعميل/crossings_log.csv")
+ap = argparse.ArgumentParser()
+ap.add_argument("video", nargs="?", default="فيديوالعميل/people-walking (1).mp4")
+ap.add_argument("--threshold", type=float, default=0.35)
+args = ap.parse_args()
 
-print(f"Loading video from: {input_video_path}")
-cap = cv2.VideoCapture(input_video_path)
+cap = cv2.VideoCapture(args.video)
 if not cap.isOpened():
-    raise FileNotFoundError(f"Video file not found: {input_video_path}")
-
+    raise FileNotFoundError(args.video)
 fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+W, H = int(cap.get(3)), int(cap.get(4))
+total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-print(f"Video Specs: {width}x{height} @ {fps} FPS, Total Frames: {total_frames}")
+device = f"GPU: {torch.cuda.get_device_name(0)} ({torch.cuda.get_device_properties(0).total_memory/2**30:.1f} GB)" \
+         if torch.cuda.is_available() else "CPU"
+print("Device:", device)
+model = RFDETRLarge()   # downloads/loads official COCO weights
 
-# Device check
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Execution Hardware Device: {device}")
-
-# Load RF-DETR Model (Apache 2.0)
-print("Loading RF-DETR Model (RFDETRLarge)...")
-model = rfdetr.RFDETRLarge()
-if hasattr(model, "to"):
-    model.to(device)
-if hasattr(model, "eval"):
-    model.eval()
-
-# Correct Direction Line Setup:
-# Downwards (towards camera, top-to-bottom) = IN
-# Upwards (away from camera, bottom-to-top) = OUT
-# By setting start=(width, 540) and end=(0, 540), crossing top-to-bottom triggers crossed_in
-start_point = sv.Point(x=width, y=540)
-end_point = sv.Point(x=0, y=540)
-line_zone = sv.LineZone(
-    start=start_point,
-    end=end_point,
-    triggering_anchors=(sv.Position.BOTTOM_CENTER,)
-)
-
-# Annotators
-line_annotator = sv.LineZoneAnnotator(thickness=3, text_thickness=2, text_scale=0.8)
-box_annotator = sv.BoxAnnotator(thickness=2)
-label_annotator = sv.LabelAnnotator(text_scale=0.6)
-trace_annotator = sv.TraceAnnotator(trace_length=30)
-
-# Tracker (Supervision ByteTrack)
+# Reversed start/end so that walking DOWN counts as IN
+line = sv.LineZone(start=sv.Point(W, 540), end=sv.Point(0, 540),
+                   triggering_anchors=(sv.Position.BOTTOM_CENTER,))
+line_ann = sv.LineZoneAnnotator(thickness=3, text_thickness=2, text_scale=0.8)
+box_ann, label_ann = sv.BoxAnnotator(thickness=2), sv.LabelAnnotator(text_scale=0.6)
+trace_ann = sv.TraceAnnotator(trace_length=30)
 tracker = sv.ByteTrack(track_activation_threshold=0.25, lost_track_buffer=30, frame_rate=int(fps))
 
-# Output Video Writer
-fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
+out_video_path = os.path.join(os.path.dirname(args.video) or ".", "output_video.mp4")
+out_csv_path = os.path.join(os.path.dirname(args.video) or ".", "crossings_log.csv")
+out_info_path = os.path.join(os.path.dirname(args.video) or ".", "run_info.txt")
 
-# CSV Logging Setup
-csv_file = open(output_csv_path, mode='w', newline='', encoding='utf-8')
-csv_writer = csv.writer(csv_file)
-csv_writer.writerow(["Timestamp (sec)", "Formatted Time", "Frame Index", "Track ID", "Direction"])
+out = cv2.VideoWriter(out_video_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+f = open(out_csv_path, "w", newline="", encoding="utf-8")
+wr = csv.writer(f)
+wr.writerow(["Timestamp (sec)", "Formatted Time", "Frame Index", "Track ID", "Direction"])
 
-events_log = []
-frame_idx = 0
-start_proc_time = time.time()
+def log(idx, tid, d):
+    t = idx / fps
+    wr.writerow([round(t, 2), f"{int(t//60):02d}:{t%60:05.2f}", idx, int(tid), d])
 
-print("Processing video frames...")
+idx, t0 = 0, time.time()
 with torch.inference_mode():
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
+    while True:
+        ok, frame = cap.read()
+        if not ok:
             break
-
-        timestamp_sec = frame_idx / fps
-
-        # RF-DETR Detection on standard image frame
         try:
-            detections = model.predict(frame, threshold=0.35, include_source_image=False)
+            det = model.predict(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), threshold=args.threshold, include_source_image=False)
         except Exception:
-            detections = model.predict(frame, threshold=0.35)
+            det = model.predict(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), threshold=args.threshold)
 
-        if not isinstance(detections, sv.Detections):
-            detections = sv.Detections.empty()
+        det = det[det.class_id == 1] if len(det) else det          # COCO "person"
+        tr = tracker.update_with_detections(det)
+        in_m, out_m = line.trigger(detections=tr)
+        for tid, i_, o_ in zip(tr.tracker_id, in_m, out_m):
+            if i_: log(idx, tid, "IN")
+            if o_: log(idx, tid, "OUT")
+        img = frame.copy()
+        if len(tr):
+            img = trace_ann.annotate(img, tr)
+            img = box_ann.annotate(img, tr)
+            img = label_ann.annotate(img, tr, labels=[f"ID #{t}" for t in tr.tracker_id])
+        out.write(line_ann.annotate(img, line))
+        idx += 1
+        if idx % 25 == 0:
+            print(f"{idx}/{total} frames processed...", flush=True)
 
-        # Filter Person Class (class_id == 1 in RF-DETR or class_id == 0)
-        if len(detections) > 0 and detections.class_id is not None:
-            person_mask = (detections.class_id == 1) | (detections.class_id == 0)
-            detections = detections[person_mask]
+cap.release(); out.release(); f.close()
 
-        # Supervision ByteTrack
-        tracked = tracker.update_with_detections(detections)
-
-        # Line Crossing Detection
-        in_mask, out_mask = line_zone.trigger(detections=tracked)
-
-        # Log IN events (Downwards)
-        if tracked.tracker_id is not None and len(tracked) > 0:
-            for tid, is_in in zip(tracked.tracker_id, in_mask):
-                if is_in:
-                    mins = int(timestamp_sec // 60)
-                    secs = timestamp_sec % 60
-                    time_str = f"{mins:02d}:{secs:05.2f}"
-                    row = [round(timestamp_sec, 2), time_str, frame_idx, int(tid), "IN"]
-                    csv_writer.writerow(row)
-                    events_log.append(row)
-                    print(f"[EVENT] Frame {frame_idx} ({time_str}) - ID #{tid} crossed IN (downwards)")
-
-            for tid, is_out in zip(tracked.tracker_id, out_mask):
-                if is_out:
-                    mins = int(timestamp_sec // 60)
-                    secs = timestamp_sec % 60
-                    time_str = f"{mins:02d}:{secs:05.2f}"
-                    row = [round(timestamp_sec, 2), time_str, frame_idx, int(tid), "OUT"]
-                    csv_writer.writerow(row)
-                    events_log.append(row)
-                    print(f"[EVENT] Frame {frame_idx} ({time_str}) - ID #{tid} crossed OUT (upwards)")
-
-        # Annotation
-        labels = [f"ID #{tid}" for tid in tracked.tracker_id] if tracked.tracker_id is not None else []
-        annotated = frame.copy()
-        if len(tracked) > 0:
-            annotated = trace_annotator.annotate(scene=annotated, detections=tracked)
-            annotated = box_annotator.annotate(scene=annotated, detections=tracked)
-            annotated = label_annotator.annotate(scene=annotated, detections=tracked, labels=labels)
-
-        try:
-            annotated = line_annotator.annotate(frame=annotated, line_counter=line_zone)
-        except Exception:
-            annotated = line_annotator.annotate(scene=annotated, line_counter=line_zone)
-
-        out.write(annotated)
-        frame_idx += 1
-
-cap.release()
-out.release()
-csv_file.close()
-
-elapsed = time.time() - start_proc_time
-proc_fps = total_frames / elapsed if elapsed > 0 else 0.0
-
-print("\n================ SUMMARY REPORT ================")
-print(f"Total Video Duration: {total_frames / fps:.2f} seconds ({total_frames} frames)")
-print(f"Total Processing Time: {elapsed:.2f} seconds ({proc_fps:.2f} FPS)")
-print(f"Final Count -> IN (Downwards): {line_zone.in_count} | OUT (Upwards): {line_zone.out_count}")
-print(f"CSV Events saved to: {output_csv_path}")
-print(f"Annotated Video saved to: {output_video_path}")
-print("================================================")
+el = time.time() - t0
+info = (f"Model: RFDETRLarge | Device: {device} | Frames: {idx} | Time: {el:.1f}s | "
+        f"Speed: {idx/el:.2f} FPS | Final IN={line.in_count} OUT={line.out_count}")
+open(out_info_path, "w").write(info + "\n")
+print("\n================ SUMMARY ================")
+print(info)
+print("=========================================")

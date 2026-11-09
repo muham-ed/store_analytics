@@ -1,0 +1,1 @@
+Model: RFDETRLarge | Device: CPU | Frames: 341 | Time: 352.0s | Speed: 0.97 FPS | Final IN=11 OUT=10
